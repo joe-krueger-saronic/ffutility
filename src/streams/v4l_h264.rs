@@ -81,6 +81,7 @@ impl V4lH264Stream {
                     enc_type: EncoderType::X264,
                     input_type: loading_image.input_type,
                     opts: vec![
+                        ("framerate".into(), "10".into()),
                         ("preset".into(), "medium".into()),
                         ("tune".into(), "stillimage".into()),
                         ("x264-params".into(), "repeat-headers=1:keyint=1:min-keyint=1:scenecut=0".into()),
@@ -147,6 +148,7 @@ impl V4lH264Stream {
             debug!("V4L Format: {:?}", format);
             // TODO: Make this EncoderConfig settable by the user
             let mut opts = vec![
+                ("framerate".into(), "15".into()),
                 ("b".into(), cfg.bitrate.to_string()),
                 ("bf".into(), "0".into()),
             ];
