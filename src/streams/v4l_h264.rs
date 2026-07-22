@@ -23,6 +23,13 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::StreamReader;
 
+// Adaptive bitrate window
+const ABR_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
+// Decrease rate on congestion
+const ABR_DECREASE: f64 = 0.75;
+// Number of clean windows before bitrate increase
+const ABR_CLEAN_WINDOWS: u32 = 3;
+
 // TODO: make this more generic so you can have a v4l stream with
 // different encoder types (e.g AV1)
 
@@ -54,6 +61,7 @@ pub struct V4lH264Config {
     pub output_width: u32,
     pub output_height: u32,
     pub bitrate: usize,
+    pub bitrate_min: usize,
     pub video_dev: String,
     pub v4l_fourcc: v4l::FourCC,
     pub loading_image: Option<LoadingImage>,
@@ -147,30 +155,37 @@ impl V4lH264Stream {
 
             let format = v4l_dev.format().unwrap();
             debug!("V4L Format: {:?}", format);
-            // TODO: Make this EncoderConfig settable by the user
-            let mut opts = vec![
-                ("framerate".into(), "15".into()),
-                ("b".into(), cfg.bitrate.to_string()),
-                ("bf".into(), "0".into()),
-            ];
-            opts.extend(ffmpeg_opts.clone());
-            // repeat-headers=1 ensures SPS/PPS are emitted regularly.
-            // Critical for seamless transitions from overlay to live feed,
-            // as the decoder needs fresh SPS/PPS headers to reinitialize.
-            opts.push(("x264-params".into(), "repeat-headers=1".into()));
-
-            let ec = EncoderConfig {
-                input_width: format.width,
-                input_height: format.height,
-                output_width: cfg.output_width,
-                output_height: cfg.output_height,
-                enc_type: EncoderType::X264,
-                input_type,
-                opts,
+            let mut pts: i64 = 0;
+            
+            // Create encoder at given bitrate
+            let make_encoder = |bitrate: usize| {
+                let mut opts: FfmpegOptions = vec![
+                    ("framerate".into(), "15".into()),
+                    ("b".into(), bitrate.to_string()),
+                    ("bf".into(), "0".into()),
+                ];
+                opts.extend(ffmpeg_opts.clone());
+                opts.push(("x264-params".into(), "repeat-headers=1".into()));
+                VideoEncoder::new(EncoderConfig {
+                    input_width: format.width,
+                    input_height: format.height,
+                    output_width: cfg.output_width,
+                    output_height: cfg.output_height,
+                    enc_type: EncoderType::X264,
+                    input_type,
+                    opts,
+                })
+                .unwrap()
             };
 
-            let mut pts: i64 = 0;
-            let mut encoder = VideoEncoder::new(ec).unwrap();
+            let bitrate_min = cfg.bitrate_min.min(cfg.bitrate);
+            let bitrate_max = cfg.bitrate;
+            let abr_step = ((bitrate_max - bitrate_min) / 8).max(1);
+            let mut curr_bitrate = bitrate_max;
+            let mut encoder = make_encoder(curr_bitrate); // dynamic bitrate encoder
+            let mut abr_window_start = std::time::Instant::now();
+            let mut abr_window_drops: u64 = 0;
+            let mut abr_clean_windows: u32 = 0;
             let mut dropped: u64 = 0;
 
             loop {
@@ -193,11 +208,39 @@ impl V4lH264Stream {
                                         dropped = 0;
                                     }
                                 }
-                                Err(TrySendError::Full(_)) => dropped += 1, // drop the frame if full
+                                Err(TrySendError::Full(_)) => { 
+                                    dropped += 1; // drop the frame if full
+                                    abr_window_drops += 1; // dropped frame this window
+                                }
                                 Err(TrySendError::Closed(_)) => return,
                             }
                         }
                         pts += 1;
+
+                        // update bitrate
+                        if bitrate_min < bitrate_max && abr_window_start.elapsed() >= ABR_WINDOW {
+                            // we have dropped frames in this window, decrease
+                            let target = if abr_window_drops > 0 {
+                                abr_clean_windows = 0;
+                                ((curr_bitrate as f64 * ABR_DECREASE) as usize).max(bitrate_min)
+                            } else {
+                                // no drops, increase
+                                abr_clean_windows += 1;
+                                if abr_clean_windows >= ABR_CLEAN_WINDOWS {
+                                    abr_clean_windows = 0;
+                                    (curr_bitrate + abr_step).min(bitrate_max)
+                                } else {
+                                    curr_bitrate
+                                }
+                            };
+                            if target != curr_bitrate {
+                                curr_bitrate = target;
+                                encoder = make_encoder(curr_bitrate); // dynamic bitrate encoder
+                                error!("{}: adaptive bitrate -> {} bps", &cfg.video_dev, curr_bitrate);
+                            }
+                            abr_window_start = std::time::Instant::now();
+                            abr_window_drops = 0;
+                        } 
                     }
                     Err(e) => {
                         if let Some(error_code) = e.raw_os_error() {
