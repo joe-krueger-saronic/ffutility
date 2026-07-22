@@ -62,6 +62,7 @@ pub struct V4lH264Config {
     pub output_height: u32,
     pub bitrate: usize,
     pub bitrate_min: usize,
+    pub target_fps: Option<u32>,
     pub video_dev: String,
     pub v4l_fourcc: v4l::FourCC,
     pub loading_image: Option<LoadingImage>,
@@ -156,11 +157,17 @@ impl V4lH264Stream {
             let format = v4l_dev.format().unwrap();
             debug!("V4L Format: {:?}", format);
             let mut pts: i64 = 0;
-            
+
+            // cap fps based on config so we don't overrun the link
+            let target_fps = cfg.target_fps.filter(|&f| f > 0);
+            let min_frame_interval = target_fps.map(|f| Duration::from_secs_f64(1.0 / f as f64));
+            let mut last_encoded: Option<std::time::Instant> = None;
+            let encoder_fps = target_fps.unwrap_or(15);
+
             // Create encoder at given bitrate
             let make_encoder = |bitrate: usize| {
                 let mut opts: FfmpegOptions = vec![
-                    ("framerate".into(), "15".into()),
+                    ("framerate".into(), encoder_fps.to_string()),
                     ("b".into(), bitrate.to_string()),
                     ("bf".into(), "0".into()),
                 ];
@@ -192,6 +199,13 @@ impl V4lH264Stream {
                 // TODO: Better error handling
                 match stream.next() {
                     Ok((m_buf, meta)) => {
+                        // skip frames arriving faster than target fps
+                        if let Some(interval) = min_frame_interval {
+                            if last_encoded.is_some_and(|t| t.elapsed() < interval) {
+                                continue;
+                            }
+                            last_encoded = Some(std::time::Instant::now());
+                        }
                         let bytesused = meta.bytesused as usize;
                         // debug!("V4L bytesused: {}", meta.bytesused);
                         if let Some(encoded_frame) =
