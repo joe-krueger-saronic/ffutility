@@ -19,6 +19,7 @@ use std::fs::File;
 use std::{io, io::Write};
 
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::StreamReader;
 
@@ -170,6 +171,7 @@ impl V4lH264Stream {
 
             let mut pts: i64 = 0;
             let mut encoder = VideoEncoder::new(ec).unwrap();
+            let mut dropped: u64 = 0;
 
             loop {
                 // TODO: Better error handling
@@ -180,7 +182,20 @@ impl V4lH264Stream {
                         if let Some(encoded_frame) =
                             encoder.encode_raw(Some(pts), &m_buf[..bytesused]).unwrap()
                         {
-                            tx.blocking_send(Ok(encoded_frame.data)).unwrap();
+                            // Try to send the frame
+                            match tx.try_send(Ok(encoded_frame.data)) {
+                                Ok(()) => {
+                                    if dropped > 0 {
+                                        error!(
+                                            "{}: consumer caught up, dropped {} frames",
+                                            &cfg.video_dev, dropped
+                                        );
+                                        dropped = 0;
+                                    }
+                                }
+                                Err(TrySendError::Full(_)) => dropped += 1, // drop the frame if full
+                                Err(TrySendError::Closed(_)) => return,
+                            }
                         }
                         pts += 1;
                     }
@@ -217,11 +232,10 @@ fn send_loading_frames(tx: &mpsc::Sender<Result<BytesMut, io::Error>>, frames: &
     }
 
     for frame in frames {
-        if tx
-            .blocking_send(Ok(BytesMut::from(frame.as_ref())))
-            .is_err()
-        {
-            return false;
+        // Drop frame if full
+        match tx.try_send(Ok(BytesMut::from(frame.as_ref()))) {
+            Ok(()) | Err(TrySendError::Full(_)) => {}
+            Err(TrySendError::Closed(_)) => return false,
         }
 
         std::thread::sleep(std::time::Duration::from_millis(250));
